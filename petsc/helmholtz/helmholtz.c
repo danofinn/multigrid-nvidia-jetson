@@ -21,8 +21,7 @@ and coarse space adaptivity.\n\n\n";
 
 typedef struct {
   /* Domain and mesh definition */
-  PetscBool shear;    /* Shear the domain */
-  PetscBool adjoint;  /* Solve the adjoint problem */
+  PetscBool trig; /* Use trig function as exact solution */
 } AppCtx;
 
 static PetscErrorCode zero(PetscInt dim, PetscReal time, const PetscReal x[], PetscInt Nc, PetscScalar *u, void *ctx)
@@ -37,7 +36,7 @@ static void g0_uu(PetscInt dim, PetscInt Nf, PetscInt NfAux,
                    PetscReal t, PetscReal u_tShift, const PetscReal x[], PetscInt numConstants, const PetscScalar constants[], PetscScalar g0[])
 {
   PetscInt d;
-  for (d = 0; d < dim; ++d) g0[d*dim+d] = 1.0;
+  for (d = 0; d < dim; ++d) g0[0] = 1.0;
 }
 
 static void g3_uu(PetscInt dim, PetscInt Nf, PetscInt NfAux,
@@ -72,7 +71,8 @@ static void f0_trig_u(PetscInt dim, PetscInt Nf, PetscInt NfAux,
                       PetscReal t, const PetscReal x[], PetscInt numConstants, const PetscScalar constants[], PetscScalar f0[])
 {
   PetscInt d;
-  for (d = 0; d < dim; ++d) f0[0] += -4.0*PetscSqr(PETSC_PI)*PetscSinReal(2.0*PETSC_PI*x[d]) + PetscSinReal(2.0*PETSC_PI*x[d]);
+  f0[0] += u[0];
+  for (d = 0; d < dim; ++d) f0[0] -= 4.0*PetscSqr(PETSC_PI)*PetscSinReal(2.0*PETSC_PI*x[d]) + PetscSinReal(2.0*PETSC_PI*x[d]);
 }
 
 static void f0_quad_u(PetscInt dim, PetscInt Nf, PetscInt NfAux,
@@ -80,23 +80,23 @@ static void f0_quad_u(PetscInt dim, PetscInt Nf, PetscInt NfAux,
                       const PetscInt aOff[], const PetscInt aOff_x[], const PetscScalar a[], const PetscScalar a_t[], const PetscScalar a_x[],
                       PetscReal t, const PetscReal x[], PetscInt numConstants, const PetscScalar constants[], PetscScalar f0[])
 {
-	PetscInt d;
-	switch (dim) {
-		case 1:
-	  		f0[0] = 1.0;
-			break;
-		case 2:
-	  		f0[0] = 5.0;
-			break;
-		case 3:
-	  		f0[0] = 13.0;
-			break;
-		default:
-			f0[0] = 5.0;
-			break;
-  	}
-	f0[0] += u[0];
-	for (d = 0; d < dim; ++d) f0[0] -= (d+1)*PetscSqr(x[d]);
+    PetscInt d;
+    switch (dim) {
+        case 1:
+            f0[0] = 1.0;
+            break;
+        case 2:
+            f0[0] = 5.0;
+            break;
+        case 3:
+            f0[0] = 11.0;
+            break;
+        default:
+            f0[0] = 5.0;
+            break;
+    }
+    f0[0] += u[0];
+    for (d = 0; d < dim; ++d) f0[0] -= (d+1)*PetscSqr(x[d]);
 }
 
 static void f1_u(PetscInt dim, PetscInt Nf, PetscInt NfAux,
@@ -111,13 +111,16 @@ static void f1_u(PetscInt dim, PetscInt Nf, PetscInt NfAux,
 static PetscErrorCode ProcessOptions(DM dm, AppCtx *options)
 {
   MPI_Comm       comm;
-  PetscInt	 	 dim;
+  PetscInt       dim;
   PetscErrorCode ierr;
 
   PetscFunctionBeginUser;
   ierr = PetscObjectGetComm((PetscObject) dm, &comm);CHKERRQ(ierr);
   ierr = DMGetDimension(dm, &dim);CHKERRQ(ierr);
+  options->trig = PETSC_FALSE;
+
   ierr = PetscOptionsBegin(comm, "", "Helmholtz Problem Options", "DMPLEX");CHKERRQ(ierr);
+  ierr = PetscOptionsBool("-exact_trig", "Use trigonometric exact solution (better for more complex finite elements)", "ex26.c", options->trig, &options->trig, NULL);CHKERRQ(ierr);
   ierr = PetscOptionsEnd();
 
 
@@ -131,7 +134,6 @@ static PetscErrorCode CreateMesh(MPI_Comm comm, AppCtx *user, DM *dm)
   PetscFunctionBeginUser;
   /* Create box mesh */
   ierr = DMPlexCreateBoxMesh(comm, 2, PETSC_TRUE, NULL, NULL, NULL, NULL, PETSC_TRUE, dm);CHKERRQ(ierr);
-  /* TODO: This should be pulled into the library */
   {
     char      convType[256];
     PetscBool flg;
@@ -162,18 +164,28 @@ static PetscErrorCode CreateMesh(MPI_Comm comm, AppCtx *user, DM *dm)
 static PetscErrorCode SetupPrimalProblem(DM dm, AppCtx *user)
 {
   PetscDS        ds;
+  DMLabel        label;
   const PetscInt id = 1;
   PetscErrorCode ierr;
 
   PetscFunctionBeginUser;
   ierr = DMGetDS(dm, &ds);CHKERRQ(ierr);
-  ierr = PetscDSSetResidual(ds, 0, f0_quad_u, f1_u);CHKERRQ(ierr);
-  ierr = PetscDSSetJacobian(ds, 0, 0, g0_uu, NULL, NULL, g3_uu);CHKERRQ(ierr);
-  ierr = PetscDSSetExactSolution(ds, 0, quad_u, user);CHKERRQ(ierr);
-  ierr = DMAddBoundary(dm, DM_BC_ESSENTIAL, "wall", "marker", 0, 0, NULL, (void (*)(void)) quad_u, NULL, 1, &id, user);CHKERRQ(ierr);
-
+  ierr = DMGetLabel(dm, "marker", &label);CHKERRQ(ierr);
+  if (user->trig) {
+    ierr = PetscDSSetResidual(ds, 0, f0_trig_u, f1_u);CHKERRQ(ierr);
+    ierr = PetscDSSetJacobian(ds, 0, 0, g0_uu, NULL, NULL, g3_uu);CHKERRQ(ierr);
+    ierr = PetscDSSetExactSolution(ds, 0, trig_u, user);CHKERRQ(ierr);
+    ierr = DMAddBoundary(dm, DM_BC_ESSENTIAL, "wall", label, 1, &id, 0, 0, NULL, (void (*)(void)) trig_u, NULL, user, NULL);CHKERRQ(ierr);
+    ierr = PetscPrintf(PETSC_COMM_WORLD,"Trig Exact Solution\n");CHKERRQ(ierr);
+  } else {
+    ierr = PetscDSSetResidual(ds, 0, f0_quad_u, f1_u);CHKERRQ(ierr);
+    ierr = PetscDSSetJacobian(ds, 0, 0, g0_uu, NULL, NULL, g3_uu);CHKERRQ(ierr);
+    ierr = PetscDSSetExactSolution(ds, 0, quad_u, user);CHKERRQ(ierr);
+    ierr = DMAddBoundary(dm, DM_BC_ESSENTIAL, "wall", label, 1, &id, 0, 0, NULL, (void (*)(void)) quad_u, NULL, user, NULL);CHKERRQ(ierr);
+  }
   PetscFunctionReturn(0);
 }
+
 
 static PetscErrorCode SetupAuxDM(DM dm, PetscFE feAux, AppCtx *user)
 {
@@ -205,6 +217,7 @@ static PetscErrorCode SetupDiscretization(DM dm, const char name[], PetscErrorCo
 
   PetscFunctionBeginUser;
   ierr = DMGetDimension(dm, &dim);CHKERRQ(ierr);
+
   ierr = DMPlexGetHeightStratum(dm, 0, &cStart, NULL);CHKERRQ(ierr);
   ierr = DMPlexGetCellType(dm, cStart, &ct);CHKERRQ(ierr);
   simplex = DMPolytopeTypeGetNumVertices(ct) == DMPolytopeTypeGetDim(ct)+1 ? PETSC_TRUE : PETSC_FALSE;
@@ -227,42 +240,42 @@ static PetscErrorCode SetupDiscretization(DM dm, const char name[], PetscErrorCo
 
 int main(int argc, char **argv)
 {
-	DM             dm;   /* Problem specification */
-	PetscDS        ds;
-	SNES           snes; /* Nonlinear solver */
-	Vec            u;    /* Solutions */
-	AppCtx         user; /* User-defined work context */
-	PetscErrorCode ierr;
+    DM             dm;   /* Problem specification */
+    PetscDS        ds;
+    SNES           snes; /* Nonlinear solver */
+    Vec            u;    /* Solutions */
+    AppCtx         user; /* User-defined work context */
+    PetscErrorCode ierr;
 
-	ierr = PetscInitialize(&argc, &argv, NULL, help);if (ierr) return ierr;
-	/* Primal system */
-	ierr = SNESCreate(PETSC_COMM_WORLD, &snes);CHKERRQ(ierr);
-	ierr = CreateMesh(PETSC_COMM_WORLD, &user, &dm);CHKERRQ(ierr);
-	ierr = ProcessOptions(dm, &user);CHKERRQ(ierr);
-	ierr = SNESSetDM(snes, dm);CHKERRQ(ierr);
-	ierr = SetupDiscretization(dm, "potential", SetupPrimalProblem, &user);CHKERRQ(ierr);
-	ierr = DMCreateGlobalVector(dm, &u);CHKERRQ(ierr);
-	ierr = VecSet(u, 0.0);CHKERRQ(ierr);
-	ierr = PetscObjectSetName((PetscObject) u, "potential");CHKERRQ(ierr);
-	ierr = DMPlexSetSNESLocalFEM(dm, &user, &user, &user);CHKERRQ(ierr);
-	ierr = SNESSetFromOptions(snes);CHKERRQ(ierr);
-	ierr = DMSNESCheckFromOptions(snes, u);CHKERRQ(ierr);
+    ierr = PetscInitialize(&argc, &argv, NULL, help);if (ierr) return ierr;
+    /* Primal system */
+    ierr = SNESCreate(PETSC_COMM_WORLD, &snes);CHKERRQ(ierr);
+    ierr = CreateMesh(PETSC_COMM_WORLD, &user, &dm);CHKERRQ(ierr);
+    ierr = ProcessOptions(dm, &user);CHKERRQ(ierr);
+    ierr = SNESSetDM(snes, dm);CHKERRQ(ierr);
+    ierr = SetupDiscretization(dm, "potential", SetupPrimalProblem, &user);CHKERRQ(ierr);
+    ierr = DMCreateGlobalVector(dm, &u);CHKERRQ(ierr);
+    ierr = VecSet(u, 0.0);CHKERRQ(ierr);
+    ierr = PetscObjectSetName((PetscObject) u, "potential");CHKERRQ(ierr);
+    ierr = DMPlexSetSNESLocalFEM(dm, &user, &user, &user);CHKERRQ(ierr);
+    ierr = SNESSetFromOptions(snes);CHKERRQ(ierr);
+    ierr = DMSNESCheckFromOptions(snes, u);CHKERRQ(ierr);
 
-	/*Looking for field error*/
-	PetscInt Nfields;
-	ierr = DMGetDS(dm, &ds);CHKERRQ(ierr);
-	ierr = PetscDSGetNumFields(ds, &Nfields);CHKERRQ(ierr);
-	ierr = SNESSolve(snes, NULL, u);CHKERRQ(ierr);
-	ierr = SNESGetSolution(snes, &u);CHKERRQ(ierr);
-	ierr = VecViewFromOptions(u, NULL, "-potential_view");CHKERRQ(ierr);
+    /*Looking for field error*/
+    PetscInt Nfields;
+    ierr = DMGetDS(dm, &ds);CHKERRQ(ierr);
+    ierr = PetscDSGetNumFields(ds, &Nfields);CHKERRQ(ierr);
+    ierr = SNESSolve(snes, NULL, u);CHKERRQ(ierr);
+    ierr = SNESGetSolution(snes, &u);CHKERRQ(ierr);
+    ierr = VecViewFromOptions(u, NULL, "-potential_view");CHKERRQ(ierr);
 
 
-	/* Cleanup */
-	ierr = VecDestroy(&u);CHKERRQ(ierr);
-	ierr = SNESDestroy(&snes);CHKERRQ(ierr);
-	ierr = DMDestroy(&dm);CHKERRQ(ierr);
-	ierr = PetscFinalize();
-	return ierr;
+    /* Cleanup */
+    ierr = VecDestroy(&u);CHKERRQ(ierr);
+    ierr = SNESDestroy(&snes);CHKERRQ(ierr);
+    ierr = DMDestroy(&dm);CHKERRQ(ierr);
+    ierr = PetscFinalize();
+    return ierr;
 }
 
 
